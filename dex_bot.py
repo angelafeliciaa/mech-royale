@@ -178,6 +178,8 @@ class Bot:
         self.cover_at = -99.0
         self.last_hurt = -99.0
         self.hurt_bearing = 0.0
+        # attacker id -> last time it hit us; survives the attacker being unseen/untracked.
+        self.hurt_by = {}
         self.npc_hurt = -99.0
         self.npc_bearing = 0.0
         self.sound_t = -99.0
@@ -242,6 +244,7 @@ class Bot:
                     self.last_hurt = now
                     if ev.get("bearing") is not None:
                         self.hurt_bearing = ev["bearing"]
+                    self.hurt_by[by] = now
                     if by in self.tracks:
                         self.tracks[by]["hit_me"] = now
                     if by in self.npcs:
@@ -255,6 +258,7 @@ class Bot:
                 self.bad[ev.get("id")] = now + 30.0
 
         self.bad = {k: v for k, v in self.bad.items() if v > now}
+        self.hurt_by = {k: v for k, v in self.hurt_by.items() if now - v < 12.0}
 
         # Track loudest recent combat sound bearing for idle scanning.
         best_sw = 0.0
@@ -296,7 +300,9 @@ class Bot:
                 "seen": now,
                 "dist": dist,
                 "closing": closing,
-                "hit_me": prev["hit_me"] if prev else -100.0,
+                # A mech that shot us before we could see it (or after its track expired) must
+                # still count as having hit us once it comes into view.
+                "hit_me": max(prev["hit_me"] if prev else -100.0, self.hurt_by.get(mid, -100.0)),
                 "engage": False,
             }
             c = actor_center(self.cfg, entry)
@@ -343,7 +349,7 @@ class Bot:
                     del store[iid]
 
         # Detect practice squad (nobody kills each other) vs FFA.
-        if self.start_alive - obs["alive"] - self.kills > 0:
+        if self.start_alive - obs["alive"] - self.kills >= 3:
             self.other_dead += 1
         else:
             self.other_dead = 0
@@ -654,6 +660,11 @@ class Bot:
             if losing:
                 self.lose_at = now
             self.retreat = self.lose_at > 0.0 and (now - self.lose_at < 1.5)
+
+        if not self.retreat:
+            # A cover spot from an earlier retreat is stale; a later retreat with no visible
+            # threat would otherwise walk back to it (possibly far away or out of the zone).
+            self.cover_goal = None
 
         zgx, zgy = self.zone.goal(zone, x, y)
         zdist = math.hypot(zgx - x, zgy - y)
