@@ -15,7 +15,7 @@ from dex_combat import (
     weapon_slot,
 )
 from dex_nav import NavGrid
-from dex_tactics import ZoneTracker, dodge_mortar, dodge_threats, fight_move
+from dex_tactics import ZoneTracker, dodge_mortar, dodge_threats, fight_move, laser_peek_phase
 import mechfight as mf
 
 # Branch profile selector: "v2", "stack", "aggro", or "duel".
@@ -98,6 +98,7 @@ def make_params(profile: str):
         "explore": False,
         "shoot_crates": False,
         "dual_ring": False,
+        "laser_peek": False,   # laser peek-shot cycle: charge behind cover, step out, release, step back
         "light_first": False,
         "light_seek": 0.0,
         # Survival knobs (0 / False disables each).
@@ -139,6 +140,7 @@ def squad_params(base: dict, profile: str):
         "lethal_k": 0.75,
         "finish": 20.0,
         "heal_hp": 0.40,
+        "laser_peek": True,
     })
     if profile in ("stack", "aggro", "duel"):
         p["pursue"] = 0.38
@@ -201,6 +203,12 @@ class Bot:
         self.sound_t = -99.0
         self.sound_bearing = 0.0
         self.last_threat_at = -99.0
+        # Laser peek-shot cycle (see dex_tactics.laser_peek_phase).
+        self.peek_phase = "none"
+        self.peek_since = -99.0
+        self.peek_at = -99.0
+        self.peek_cover = True
+        self.short_until = -99.0
 
         self.loot_id = None
         self.loot_since = 0.0
@@ -285,6 +293,9 @@ class Bot:
                 self.bad[ev.get("id")] = now + 10.0
             elif et == "dropped":
                 self.bad[ev.get("id")] = now + 30.0
+            elif et == "effect" and ev.get("effect") == "short":
+                # Lightning short: charge lost, no new charge for short_s.
+                self.short_until = now + float(self.cfg["weapons"].get("lightning", {}).get("short_s", 2.0) or 2.0)
 
         self.bad = {k: v for k, v in self.bad.items() if v > now}
 
@@ -688,6 +699,9 @@ class Bot:
             foe = hidden
         if foe is None and self.p["pursue"] > 0.0 and hidden is not None and hidden["hp"] < self.p["pursue"] * max(1.0, hidden["max_hp"]):
             foe = hidden
+        # Mid peek-cycle we are the one hiding: keep fighting the foe we just ducked from.
+        if foe is None and hidden is not None and laser is not None and self.p.get("laser_peek", False) and now - self.peek_at < 4.0:
+            foe = hidden
 
         danger = False
         crowd = 0
@@ -767,6 +781,8 @@ class Bot:
         farm = None
         farm_pos = None
         travel_dist = 0.0
+        laser_mode = "off" if now < self.short_until else None
+        peek_phase = "none"
 
         esc = self._escape_rooftop(me, now)
         mortar_mv = dodge_mortar(self.cfg, self.arena, self.nav, obs) if esc is None else None
@@ -851,9 +867,38 @@ class Bot:
             if closing_finish:
                 move_p = dict(self.p)
                 move_p["gun_range"] = move_p["laser_range"] = move_p["light_range"] = self.p["finish"]
+
+            # Laser peek-shot cycle: hide -> charge behind cover -> pop out, release -> cool behind cover.
+            peek_info = None
+            if self.p.get("laser_peek", False) and laser is not None:
+                ws = laser["stats"]
+                peek_phase, self.peek_since = laser_peek_phase(
+                    self.peek_phase, self.peek_since, now,
+                    laser.get("charge", 0.0) or 0.0, ws["charge"], laser.get("cooldown", 0.0) or 0.0,
+                    target is not None, foe["dist"], foe["dist"] <= ws["range"] * 0.97,
+                    now < self.short_until, self.peek_cover,
+                    closing_finish or late or foe["hp"] < self.p["finish_hp"] * max(1.0, foe["max_hp"]),
+                )
+                if peek_phase != self.peek_phase and peek_phase == "hide":
+                    self.peek_cover = True  # optimistic until fight_move reports
+                if peek_phase in ("hide", "charge", "cool"):
+                    want_los = -1.0 if (self.peek_cover or peek_phase == "charge") else want_los
+                    if peek_phase == "hide":
+                        laser_mode = laser_mode or "hold"
+                elif peek_phase == "pop":
+                    want_los = 1.0
+                if peek_phase != "none":
+                    peek_info = {}
+                    if move_p is self.p:
+                        move_p = dict(self.p)
+                    move_p["dual_ring"] = True  # 12 m ring too: cover within ~10 m
+                    move_p["ring2_coarse"] = True
             mx, my = fight_move(
                 self.cfg, self.arena, self.nav, self.zone, obs, foe, seen, self.cubes, want_los, move_p, self.fight_state,
+                info=peek_info,
             )
+            if peek_info is not None and peek_phase in ("hide", "cool"):
+                self.peek_cover = bool(peek_info.get("any_hidden", False))
             if light is not None and foe["dist"] > 50.0 and me["energy"] > 55.0 and want_los > 0.0:
                 boost = True
             if self.p["finish_rush"] and closing_finish and foe["dist"] > 40.0 and me["energy"] > 35.0 and (laser is None or laser.get("charge", 0.0) <= 0.0):
@@ -1022,7 +1067,12 @@ class Bot:
             self.npc_hurt, self.npc_bearing, self.last_threat_at,
             self.sound_t, self.sound_bearing,
             face=(hidden if self.p.get("face_hidden", False) else None),
+            laser_mode=laser_mode,
         )
+        self.peek_phase = peek_phase
+        if peek_phase != "none":
+            self.peek_at = now
+            mode = f"{mode}:peek-{peek_phase}"
 
         # Weapon pickups.
         pickup_r = self.cfg["loot"]["pickup_radius"] - 0.3
