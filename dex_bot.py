@@ -15,6 +15,7 @@ from dex_combat import (
     weapon_slot,
 )
 from dex_nav import NavGrid
+from dex_roof import RoofPlanner
 from dex_tactics import ZoneTracker, dodge_mortar, dodge_threats, fight_move
 import mechfight as mf
 
@@ -91,6 +92,9 @@ def make_params(profile: str):
         "dual_ring": False,
         "light_first": False,
         "light_seek": 0.0,
+        "roof_camp": False,
+        "roof_edge_back": 3.5,
+        "roof_hold_hp": 0.45,
     }
     if profile in ("stack", "aggro", "duel"):
         base["opening"] = True
@@ -123,6 +127,7 @@ def squad_params(base: dict, profile: str):
         "lethal": True,
         "lethal_k": 0.75,
         "finish": 20.0,
+        "roof_camp": True,
     })
     if profile in ("stack", "aggro", "duel"):
         p["pursue"] = 0.38
@@ -208,6 +213,28 @@ class Bot:
         }
         self.last_aim = [0.0, 0.0]
         self.mode = "init"
+
+        # Rooftop camping state.
+        try:
+            self.roof = RoofPlanner(self.arena, self.nav, self.cfg["mech"])
+            print(f"roof: {len(self.roof.cands)} candidates", file=sys.stderr, flush=True)
+            for c in self.roof.cands[:3]:
+                print(f"roof:  idx={c.idx} top={c.top:.1f} h={c.h:.1f} center=({c.center[0]:.0f},{c.center[1]:.0f}) "
+                      f"clear={c.clear:.1f} launches={len(c.launches)}", file=sys.stderr, flush=True)
+        except Exception as exc:
+            print("roof: init failed:", repr(exc), file=sys.stderr, flush=True)
+            self.roof = None
+        self.roof_state = None          # None | "travel" | "climb" | "hold"
+        self.roof_cand = None
+        self.roof_launch = None         # (launch_xy, land_xy, climb_h)
+        self.roof_pick_at = -99.0
+        self.roof_bad = {}
+        self.roof_climb_at = -99.0
+        self.roof_tries = 0
+        self.roof_airborne = False
+        self.roof_stand = None
+        self.roof_stand_at = -99.0
+        self.roof_hold_since = -99.0
 
     # -------------------------------------------------------------- public act
     def act(self, obs: mf.Observation) -> mf.Action:
@@ -583,6 +610,165 @@ class Bot:
                     break
         return self.explore_xy
 
+    # -------------------------------------------------------------- rooftop camping
+    def _roof_reset(self):
+        self.roof_state = None
+        self.roof_cand = None
+        self.roof_launch = None
+        self.roof_airborne = False
+        self.roof_tries = 0
+        self.roof_stand = None
+
+    def _roof_move(self, obs, me, now, seen, foe, hp_frac):
+        """Return (mx, my, boost, jump, mode) while rooftop camping, or None to use ground logic."""
+        if self.roof is None or not self.roof.cands or not self.p.get("roof_camp"):
+            if self.roof_state is not None:
+                self._roof_reset()
+            return None
+        zone = obs["zone"]
+        x, y, zf = me["pos"]
+        if zone["next_radius"] < 30.0:
+            self._roof_reset()
+            return None
+
+        cand = self.roof_cand
+        # Re-validate the current roof against the zone; re-pick when needed.
+        if cand is not None:
+            cx, cy = cand.center
+            nx, ny = zone["next_center"]
+            if math.hypot(cx - nx, cy - ny) > zone["next_radius"] - 6.0 or self.roof_bad.get(cand.idx, -1.0) > now:
+                self._roof_reset()
+                cand = None
+        if cand is None:
+            if now - self.roof_pick_at < 1.5:
+                return None
+            self.roof_pick_at = now
+            picked = self.roof.pick(x, y, self.zone, zone, now, self.roof_bad)
+            if picked is None:
+                return None
+            self.roof_cand, self.roof_launch = picked
+            cand = self.roof_cand
+            self.roof_state = "travel"
+            self.roof_tries = 0
+            self.roof_airborne = False
+            self.nav.clear_path()
+        elif self.roof_state == "travel" and now - self.roof_pick_at > 4.0 and not self.roof.is_on(cand, x, y, zf):
+            # Keep the launch point current (nearest one to us) while travelling.
+            self.roof_pick_at = now
+            ld, lp = math.inf, None
+            for lp_ in cand.launches:
+                dd = math.hypot(lp_[0][0] - x, lp_[0][1] - y)
+                if dd < ld:
+                    ld, lp = dd, lp_
+            if lp is not None:
+                self.roof_launch = lp
+
+        on_roof = self.roof.is_on(cand, x, y, zf)
+        if on_roof and me["grounded"]:
+            if self.roof_state != "hold":
+                self.roof_hold_since = now
+                self.roof_stand = None
+            self.roof_state = "hold"
+            return self._roof_hold(obs, me, now, seen, foe, hp_frac, cand)
+
+        launch, land, climb_h = self.roof_launch
+        need_e = min(95.0, 1.5 * climb_h + 14.0)
+        dl = math.hypot(launch[0] - x, launch[1] - y)
+
+        if self.roof_state == "hold":
+            # Fell/was knocked off: treat as travel again.
+            self.roof_state = "travel"
+            self.nav.clear_path()
+
+        if self.roof_state == "climb":
+            if not me["grounded"]:
+                self.roof_airborne = True
+                ux, uy = land[0] - x, land[1] - y
+                d = math.hypot(ux, uy) or 1.0
+                jet = zf < cand.top + 1.0 and me["energy"] > 1.0
+                return (ux / d, uy / d, jet, False, "roof:climb")
+            if self.roof_airborne:
+                # Landed somewhere that's not the roof: count a failed try.
+                self.roof_airborne = False
+                self.roof_tries += 1
+                if self.roof_tries >= 3 or now - self.roof_climb_at > 14.0:
+                    self.roof_bad[cand.idx] = now + 45.0
+                    self._roof_reset()
+                    return None
+                self.roof_state = "travel"
+            elif now - self.roof_climb_at < 0.4:
+                # Jump issued; still grounded this tick: push into the wall.
+                ux, uy = land[0] - x, land[1] - y
+                d = math.hypot(ux, uy) or 1.0
+                return (ux / d, uy / d, False, False, "roof:climb")
+            else:
+                self.roof_state = "travel"
+
+        # Travel to the launch point.
+        if dl > 2.0:
+            mx, my = self.nav.steer_to(me["pos"], launch, now)
+            if mx == 0.0 and my == 0.0:
+                ux, uy = launch[0] - x, launch[1] - y
+                mx, my = ux / dl, uy / dl
+            boost = (
+                dl > 60.0 and me["energy"] > 55.0
+                and not any(t["seen"] == now and t["dist"] < 90.0 for t in seen)
+            )
+            return (mx, my, boost, False, "roof:travel")
+
+        # At the launch point: wait for energy, then jump + jet into the wall.
+        if not me["grounded"] or me["energy"] < need_e:
+            return (0.0, 0.0, False, False, "roof:wait")
+        self.roof_state = "climb"
+        self.roof_climb_at = now
+        self.roof_airborne = False
+        ux, uy = land[0] - x, land[1] - y
+        d = math.hypot(ux, uy) or 1.0
+        return (ux / d, uy / d, False, True, "roof:climb")
+
+    def _roof_hold(self, obs, me, now, seen, foe, hp_frac, cand):
+        x, y, zf = me["pos"]
+        back = max(self.p.get("roof_edge_back", 3.5), self.cfg["mech"]["radius"] * mech_scale(self.cfg, me["cubes"]) + 0.6)
+        threat = foe
+        if threat is None:
+            best = None
+            for t in seen:
+                if now - t["seen"] < 4.0 and t["dist"] < 160.0 and (best is None or t["dist"] < best["dist"]):
+                    best = t
+            threat = best
+        hurt_recent = now - self.last_hurt < 2.0
+        want_center = (
+            threat is None
+            or hp_frac < self.p.get("roof_hold_hp", 0.45)
+            or (hurt_recent and not threat.get("los", False) and threat["dist"] > 20.0)
+        )
+        if want_center:
+            goal = cand.center
+        else:
+            key = (round(threat["pos"][0] / 4.0), round(threat["pos"][1] / 4.0))
+            if self.roof_stand is None or self.roof_stand[0] != key or now - self.roof_stand_at > 0.8:
+                pt = self.roof.edge_point(cand, threat["pos"][0], threat["pos"][1], back)
+                self.roof_stand = (key, pt)
+                self.roof_stand_at = now
+            goal = self.roof_stand[1]
+        dx, dy = goal[0] - x, goal[1] - y
+        d = math.hypot(dx, dy)
+        mode = "roof:center" if want_center else "roof:edge"
+        if d < 0.7:
+            return (0.0, 0.0, False, False, mode)
+        ux, uy = dx / d, dy / d
+        # Never step toward a point that leaves the roof.
+        ahead = 3.0 if d > 3.0 else d
+        if not self.roof.on_roof_ok(cand, x + ux * ahead, y + uy * ahead, back - 0.5):
+            cx, cy = cand.center
+            dx, dy = cx - x, cy - y
+            d = math.hypot(dx, dy)
+            if d < 0.7:
+                return (0.0, 0.0, False, False, mode)
+            ux, uy = dx / d, dy / d
+        speed = 1.0 if d > 4.0 else max(0.35, d / 4.0)
+        return (ux * speed, uy * speed, False, False, mode)
+
     # -------------------------------------------------------------- main tick
     def _step(self, obs):
         self._observe(obs)
@@ -665,24 +851,38 @@ class Bot:
         farm_pos = None
         travel_dist = 0.0
 
-        esc = self._escape_rooftop(me, now)
-        mortar_mv = dodge_mortar(self.cfg, self.arena, self.nav, obs) if esc is None else None
+        roof_mv = None
+        if self.p.get("roof_camp"):
+            try:
+                roof_mv = self._roof_move(obs, me, now, seen, foe, hp_frac)
+            except Exception as exc:
+                print("roof: error:", repr(exc), file=sys.stderr, flush=True)
+                self._roof_reset()
+                roof_mv = None
+        elif self.roof_state is not None:
+            self._roof_reset()
+        roof_lock = roof_mv is not None and roof_mv[4] != "roof:travel"
+
+        esc = None if roof_lock else self._escape_rooftop(me, now)
+        mortar_mv = dodge_mortar(self.cfg, self.arena, self.nav, obs) if (esc is None and not roof_lock) else None
 
         if esc is not None:
             mx, my, boost, jump = esc
             mode = "escape"
-        elif now < self.unstuck_until:
+        elif now < self.unstuck_until and not roof_lock:
             mx, my = self.unstuck_dir
             mode = "unstuck"
         elif mortar_mv is not None:
             mx, my = mortar_mv
             boost = me["energy"] > 15.0
             mode = "dodge"
-        elif zone_must and zdist > 2.0:
+        elif zone_must and zdist > 2.0 and not (roof_lock and me["in_zone"]):
             mx, my = self.nav.steer_to(me["pos"], (zgx, zgy), now)
             boost = (not me["in_zone"] or now + t_need >= deadline) and me["energy"] > 5.0
             mode = "zone"
-        elif self.retreat and not finishing and not late:
+        elif roof_mv is not None and roof_lock:
+            mx, my, boost, jump, mode = roof_mv
+        elif self.retreat and not finishing and not late and not (roof_mv is not None and hp_frac > 0.3 and not swamped):
             threats = [actor_eye(self.cfg, t) for t in sorted(seen, key=lambda t: t["dist"])[:4] if t["dist"] < 230.0]
             if threats and now - self.cover_at >= 0.4:
                 self.cover_at = now
@@ -702,6 +902,10 @@ class Bot:
             else:
                 mx, my = self.nav.steer_to(me["pos"], (zgx, zgy), now)
                 mode = "flee"
+        elif roof_mv is not None:
+            mx, my, boost, jump, mode = roof_mv
+            dl_ = math.hypot(self.roof_launch[0][0] - x, self.roof_launch[0][1] - y) if self.roof_launch else 0.0
+            travel_dist = dl_ if dl_ > 80.0 else 0.0
         elif foe is not None:
             ready = gun is not None and gun.get("ammo", 0) > 0 and gun.get("reload", 0.0) <= 0.25 and foe["dist"] <= gun["stats"]["range"] - 10.0
             hot = laser is not None and laser.get("charge", 0.0) >= laser["stats"]["charge"] - 0.3 and foe["dist"] <= laser["stats"]["range"] - 5.0
@@ -814,7 +1018,7 @@ class Bot:
                 self.travel_boost_on = False
 
         # Bullet & charging-laser dodging.
-        if self.p["dodge"] and mode not in ("unstuck", "escape"):
+        if self.p["dodge"] and mode not in ("unstuck", "escape", "roof:climb", "roof:wait"):
             ddx, ddy, lz = dodge_threats(
                 self.cfg, self.arena, self.nav, self.zone, obs,
                 self.fight_state["strafe"], wall_aware=self.p["wall_dodge"],
@@ -828,8 +1032,18 @@ class Bot:
                 if lz and me["energy"] > 25.0:
                     boost = True
 
+        # Rooftop hold: never let dodging push us off the roof.
+        if mode in ("roof:edge", "roof:center") and self.roof_cand is not None and (mx != 0.0 or my != 0.0):
+            try:
+                ml = math.hypot(mx, my) or 1.0
+                if not self.roof.on_roof_ok(self.roof_cand, x + mx / ml * 3.0, y + my / ml * 3.0, 2.5):
+                    mx = my = 0.0
+                    boost = False
+            except Exception:
+                mx = my = 0.0
+
         # Stuck detection & jump recovery.
-        if mode == "escape":
+        if mode == "escape" or mode in ("roof:climb", "roof:wait", "roof:edge", "roof:center"):
             self.stuck_since = -1.0
         elif (mx != 0.0 or my != 0.0) and math.hypot(me["vel"][0], me["vel"][1]) < 1.2 and me["grounded"]:
             if self.stuck_since < 0.0:
