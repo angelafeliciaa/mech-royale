@@ -276,11 +276,17 @@ class Bot:
             dx, dy = pos[0] - x, pos[1] - y
             dist = math.hypot(dx, dy)
             closing = -(vel[0] * dx + vel[1] * dy) / max(dist, 1.0)
+            acc = (0.0, 0.0, 0.0)
+            if prev is not None and 0.0 < now - prev["seen"] < 0.15:
+                idt = 1.0 / (now - prev["seen"])
+                pv = prev["vel"]
+                acc = ((vel[0] - pv[0]) * idt, (vel[1] - pv[1]) * idt, 0.0)
             entry = {
                 "id": mid,
                 "kind": m["kind"],
                 "pos": pos,
                 "vel": vel,
+                "acc": acc,
                 "aim": m.get("aim", (0.0, 0.0)),
                 "hp": m.get("hp", m.get("max_hp", 1400.0)),
                 "max_hp": m.get("max_hp", 1400.0),

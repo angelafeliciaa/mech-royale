@@ -265,26 +265,43 @@ def dodge_threats(cfg, arena, nav, zone_tracker, obs, strafe_sign, wall_aware=Fa
     dx = dy = 0.0
     laser_threat = False
 
+    mvx, mvy, mvz = me["vel"]
+    half_h = me["stats"]["height"] * 0.5 + 0.6
     for p in obs.get("projectiles", ()):
         if p["kind"] == "mortar":
             continue
         px, py, pz = p["pos"]
         vx, vy, vz = p["vel"]
-        v2 = vx * vx + vy * vy + vz * vz
+        # Work in our own frame: enemies lead our velocity, so a bullet that will
+        # hit us looks like a miss relative to where we stand right now.
+        rvx, rvy, rvz = vx - mvx, vy - mvy, vz - mvz
+        v2 = rvx * rvx + rvy * rvy + rvz * rvz
         if v2 < 1.0:
             continue
-        tc = ((x - px) * vx + (y - py) * vy + (cz - pz) * vz) / v2
+        tc = ((x - px) * rvx + (y - py) * rvy + (cz - pz) * rvz) / v2
         if tc <= 0.0 or tc > 0.7:
             continue
-        mxx = px + vx * tc - x
-        myy = py + vy * tc - y
-        if math.hypot(mxx, myy) < reach:
+        mxx = px + rvx * tc - x
+        myy = py + rvy * tc - y
+        mzz = pz + rvz * tc - cz
+        if abs(mzz) > half_h:
+            continue
+        miss = math.hypot(mxx, myy)
+        if miss < reach:
             vh = math.hypot(vx, vy)
             if vh < 1.0:
                 continue
             perp_x, perp_y = -vy / vh, vx / vh
-            if perp_x * mxx + perp_y * myy > 0.0:
-                perp_x, perp_y = -perp_x, -perp_y
+            if miss > 0.6:
+                # Step away from the side the bullet passes on.
+                if perp_x * mxx + perp_y * myy > 0.0:
+                    perp_x, perp_y = -perp_x, -perp_y
+            else:
+                # Dead-on: the shooter led our current motion, so reverse it.
+                lat = perp_x * mvx + perp_y * mvy
+                if lat > 1.5 or (lat >= -1.5 and strafe_sign > 0.0):
+                    # (fight_move strafes along -perp*strafe_sign; agree with it when idle)
+                    perp_x, perp_y = -perp_x, -perp_y
             if wall_aware and not nav.line_walkable(x, y, x + perp_x * 5.0, y + perp_y * 5.0):
                 if nav.line_walkable(x, y, x - perp_x * 5.0, y - perp_y * 5.0):
                     perp_x, perp_y = -perp_x, -perp_y

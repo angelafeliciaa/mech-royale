@@ -3,6 +3,7 @@
 import math
 
 LATENCY = 0.075
+EFFECTIVE_RANGE = 175.0
 
 
 def angle_diff(a, b):
@@ -29,22 +30,42 @@ def gun_flight_time(rx, ry, rz, vx, vy, vz, speed, launch_offset):
     return dist / speed
 
 
-def exact_gun_aim(muzzle, target_pos, target_vel, speed, launch_offset, grounded):
-    """Compute exact (yaw, pitch) intercept accounting for decision latency and launch offset."""
+# Enemy velocity autocorrelation measured from the kit's recorded match decays
+# ~exp(-LEAD_DECAY*tau): strafing bots flip often, so expected displacement over
+# tau is v*(1-exp(-k*tau))/k, not v*tau. Current acceleration adds a small term.
+LEAD_DECAY = 1.0
+ACC_GAIN = 0.04
+MAX_ACC = 60.0
+
+
+def lead_displacement(vx, vy, vz, ax, ay, tau):
+    if tau <= 0.0:
+        return 0.0, 0.0, 0.0
+    g = (1.0 - math.exp(-LEAD_DECAY * tau)) / LEAD_DECAY
+    ga = ACC_GAIN * tau
+    return vx * g + ax * ga, vy * g + ay * ga, vz * g
+
+
+def exact_gun_aim(muzzle, target_pos, target_vel, speed, launch_offset, grounded, target_acc=None):
+    """Compute (yaw, pitch) intercept with damped lead, decision latency and launch offset."""
     speed = speed if speed > 0 else 252.0
     launch_offset = launch_offset if launch_offset > 0 else 3.0
     vx, vy = target_vel[0], target_vel[1]
     vz = 0.0 if grounded else target_vel[2] * 0.5
-    p0x = target_pos[0] + vx * LATENCY
-    p0y = target_pos[1] + vy * LATENCY
-    p0z = target_pos[2] + vz * LATENCY
-    t = gun_flight_time(
-        p0x - muzzle[0], p0y - muzzle[1], p0z - muzzle[2],
-        vx, vy, vz, speed, launch_offset,
-    )
-    px = p0x + vx * t
-    py = p0y + vy * t
-    pz = p0z + vz * t
+    ax = ay = 0.0
+    if target_acc is not None:
+        ax, ay = target_acc[0], target_acc[1]
+        am = math.hypot(ax, ay)
+        if am > MAX_ACC:
+            ax, ay = ax * MAX_ACC / am, ay * MAX_ACC / am
+    px, py, pz = target_pos[0], target_pos[1], target_pos[2]
+    for _ in range(3):
+        d = math.sqrt((px - muzzle[0]) ** 2 + (py - muzzle[1]) ** 2 + (pz - muzzle[2]) ** 2)
+        tau = LATENCY + max(0.0, d - launch_offset) / speed
+        dx, dy, dz = lead_displacement(vx, vy, vz, ax, ay, tau)
+        px = target_pos[0] + dx
+        py = target_pos[1] + dy
+        pz = target_pos[2] + dz
     return math.atan2(py - muzzle[1], px - muzzle[0]), math.atan2(pz - muzzle[2], math.hypot(px - muzzle[0], py - muzzle[1]))
 
 
@@ -209,6 +230,7 @@ def compute_fire_and_aim(
     tp = (0.0, 0.0, 0.0)
     tv = (0.0, 0.0, 0.0)
     tr = th = 0.0
+    tacc = None
 
     if target is not None:
         sc = mech_scale(cfg, target.get("cubes", 0))
@@ -219,6 +241,7 @@ def compute_fire_and_aim(
         if not arena.shot_clear(muzzle, tp):
             tp = (p[0], p[1], p[2] + th * 0.85)
         tv = tuple(target.get("vel", (0.0, 0.0, 0.0)))
+        tacc = target.get("acc")
         shootable = is_mech = True
     elif farm is not None:
         tr = cfg["npc"]["radius"]
@@ -245,8 +268,15 @@ def compute_fire_and_aim(
         gy = gp = 0.0
         if gun is not None:
             launch_offset = st["radius"] + 0.5 if st["radius"] > 0 else 3.0
-            gy, gp = exact_gun_aim(muzzle, tp, tv, gun["stats"]["speed"], launch_offset, grounded)
+            gy, gp = exact_gun_aim(muzzle, tp, tv, gun["stats"]["speed"], launch_offset, grounded, tacc)
             gun_ok = dist <= gun["stats"]["range"] * 0.96
+            if gun_ok and is_mech and dist > EFFECTIVE_RANGE:
+                # Beyond ~175 m a strafing mech's position is too uncertain over the
+                # bullet flight time; hold the mag unless it moves little across the
+                # line of sight or is already trading shots with us.
+                lat = abs(tv[0] * (tp[1] - y) - tv[1] * (tp[0] - x)) / max(dist, 1.0)
+                if lat > 4.0 and now - target["hit_me"] > 2.0:
+                    gun_ok = False
 
         dp = (tp[0] + tv[0] * (LATENCY + 0.05), tp[1] + tv[1] * (LATENCY + 0.05), tp[2])
         hy = math.atan2(dp[1] - muzzle[1], dp[0] - muzzle[0])
