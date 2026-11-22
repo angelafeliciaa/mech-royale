@@ -19,7 +19,7 @@ from dex_tactics import ZoneTracker, dodge_mortar, dodge_threats, fight_move
 import mechfight as mf
 
 # Branch profile selector: "v2", "stack", "aggro", or "duel".
-ACTIVE_PROFILE = "aggro"
+ACTIVE_PROFILE = "duel"
 # Experiment knobs applied on top of every profile (base and squad).
 OVERRIDES = {}
 
