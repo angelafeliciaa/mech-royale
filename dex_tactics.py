@@ -84,12 +84,24 @@ class ZoneTracker:
         return nx + dx / d * r, ny + dy / d * r
 
 
-def preferred_range(me, track, params):
+def preferred_range(me, track, params, state=None):
     _, light = weapon_slot(me["weapons"], "lightning")
     _, laser = weapon_slot(me["weapons"], "laser")
     r = params["gun_range"]
-    if light is not None and me["energy"] > 12.0:
-        r = params["light_range"]
+    light_ok = light is not None
+    if light_ok and state is not None:
+        # Hysteresis: once the arc runs dry, kite at gun range until energy is back, instead of oscillating.
+        low = state.get("light_low", False)
+        if low and me["energy"] > 40.0:
+            low = False
+        elif not low and me["energy"] < 9.0:
+            low = True
+        state["light_low"] = low
+        light_ok = not low
+    elif light_ok:
+        light_ok = me["energy"] > 12.0
+    if light_ok:
+        r = min(params["light_range"], light["stats"].get("range", 45.0) * 0.62)
     elif laser is not None:
         r = params["laser_range"]
     if track["kind"] == "npc":
@@ -109,7 +121,7 @@ def fight_move(cfg, arena, nav, zone_tracker, obs, target, seen, cubes, want_los
     zone = obs["zone"]
     now = obs["t"]
     x, y, zf = me["pos"]
-    rp = preferred_range(me, target, params)
+    rp = preferred_range(me, target, params, state)
 
     tx, ty = target["pos"][0], target["pos"][1]
     bx, by = tx - x, ty - y
