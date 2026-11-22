@@ -375,7 +375,7 @@ class Bot:
                     del store[iid]
 
         # Detect practice squad (nobody kills each other) vs FFA.
-        if self.start_alive - obs["alive"] - self.kills > 0:
+        if self.start_alive - obs["alive"] - self.kills >= 3:
             self.other_dead += 1
         else:
             self.other_dead = 0
