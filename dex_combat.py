@@ -194,9 +194,9 @@ def compute_fire_and_aim(
     cfg, arena, me, target, foe, farm, farm_pos, seen,
     move_xy, now, mode, params, last_hurt, hurt_bearing,
     npc_hurt, npc_bearing, last_threat_at,
-    sound_t=-99.0, sound_bearing=0.0,
+    sound_t=-99.0, sound_bearing=0.0, face=None,
 ):
-    """Return (aim, fire, want_reload)."""
+    """Return (aim, fire, want_reload). `face`: last-known hunter to keep the torso on (rear hits x1.5)."""
     x, y, zf = me["pos"]
     vx, vy, _ = me["vel"]
     st = me["stats"]
@@ -344,6 +344,8 @@ def compute_fire_and_aim(
         mx, my = move_xy
         if watch is not None:
             aim = [math.atan2(watch["pos"][1] - y, watch["pos"][0] - x), 0.0]
+        elif face is not None and now - face.get("seen", -99.0) < 8.0:
+            aim = [math.atan2(face["pos"][1] - y, face["pos"][0] - x), 0.0]
         elif npc_hurt > 0 and now - npc_hurt < 2.5:
             aim = [npc_bearing, 0.0]
         elif now - last_hurt < 2.5:

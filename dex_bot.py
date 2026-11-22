@@ -91,6 +91,12 @@ def make_params(profile: str):
         "dual_ring": False,
         "light_first": False,
         "light_seek": 0.0,
+        # Survival knobs (0 / False disables each).
+        "heal_hp": 0.0,        # enter heal-cycle (break LOS, regen) below this HP fraction
+        "heal_to": 0.78,       # leave heal-cycle at this HP fraction
+        "heal_max_s": 25.0,    # give up a heal-cycle after this long
+        "final_center": True,  # final collapse: hold the exact zone center, shoot from there
+        "face_hidden": True,   # keep torso toward the last known hunter while repositioning
     }
     if profile in ("stack", "aggro", "duel"):
         base["opening"] = True
@@ -123,6 +129,7 @@ def squad_params(base: dict, profile: str):
         "lethal": True,
         "lethal_k": 0.75,
         "finish": 20.0,
+        "heal_hp": 0.40,
     })
     if profile in ("stack", "aggro", "duel"):
         p["pursue"] = 0.38
@@ -173,6 +180,8 @@ class Bot:
         self.stick_id = None
         self.stick_at = -99.0
         self.retreat = False
+        self.healing = False
+        self.heal_since = -99.0
         self.lose_at = -99.0
         self.cover_goal = None
         self.cover_at = -99.0
@@ -649,6 +658,26 @@ class Bot:
                 self.lose_at = now
             self.retreat = self.lose_at > 0.0 and (now - self.lose_at < 1.5)
 
+        # Heal cycle: low on HP and not winning the trade -> break LOS and regen
+        # (45 HP/s after 5 s quiet) instead of trading down; stay hidden until healed.
+        heal_hp = self.p.get("heal_hp", 0.0)
+        if heal_hp > 0.0 and not late:
+            if not self.healing:
+                tf = target["hp"] / max(1.0, target["max_hp"]) if target is not None else None
+                threatened = danger or now - self.last_hurt < 4.0
+                if (hp_frac < heal_hp and threatened and not finishing
+                        and (tf is None or tf > hp_frac + 0.10 or crowd >= 2)):
+                    self.healing = True
+                    self.heal_since = now
+                    self.cover_at = -99.0
+            elif (hp_frac >= self.p.get("heal_to", 0.78) or finishing
+                    or now - self.heal_since > self.p.get("heal_max_s", 25.0)):
+                self.healing = False
+            if self.healing:
+                self.retreat = True
+        else:
+            self.healing = False
+
         zgx, zgy = self.zone.goal(zone, x, y)
         zdist = math.hypot(zgx - x, zgy - y)
         walk = max(1.0, st["walk_speed"])
@@ -656,6 +685,16 @@ class Bot:
         deadline = self.zone.deadline(zone, x, y, 8.0)
         zone_must = (not me["in_zone"]) or (now + t_need + 3.0 >= deadline)
         zone_should = now + t_need + 14.0 >= deadline
+        # Final collapse (next radius 0, 260 HP/s): every metre from the centre costs ~1-2 s of
+        # 260 dps, so hold the exact centre and shoot from there instead of fighting at the edge.
+        final_rush = (
+            self.p.get("final_center", False)
+            and zone["next_radius"] <= 1.0
+            and now >= zone["shrink_start"] - 8.0
+        )
+        if final_rush:
+            zgx, zgy = zone["next_center"][0], zone["next_center"][1]
+            zdist = math.hypot(zgx - x, zgy - y)
 
         mx = my = 0.0
         boost = False
@@ -682,6 +721,13 @@ class Bot:
             mx, my = self.nav.steer_to(me["pos"], (zgx, zgy), now)
             boost = (not me["in_zone"] or now + t_need >= deadline) and me["energy"] > 5.0
             mode = "zone"
+        elif final_rush and zdist > 0.8:
+            mx, my = self.nav.steer_to(me["pos"], (zgx, zgy), now)
+            boost = me["energy"] > 20.0 and zdist > 6.0
+            # Far out: "zone" mode suppresses half-speed laser charging; near: shoot freely.
+            mode = "zone" if zdist > 6.0 else "center"
+        elif final_rush:
+            mode = "center"
         elif self.retreat and not finishing and not late:
             threats = [actor_eye(self.cfg, t) for t in sorted(seen, key=lambda t: t["dist"])[:4] if t["dist"] < 230.0]
             if threats and now - self.cover_at >= 0.4:
@@ -814,7 +860,7 @@ class Bot:
                 self.travel_boost_on = False
 
         # Bullet & charging-laser dodging.
-        if self.p["dodge"] and mode not in ("unstuck", "escape"):
+        if self.p["dodge"] and mode not in ("unstuck", "escape", "center"):
             ddx, ddy, lz = dodge_threats(
                 self.cfg, self.arena, self.nav, self.zone, obs,
                 self.fight_state["strafe"], wall_aware=self.p["wall_dodge"],
@@ -883,6 +929,7 @@ class Bot:
             (mx, my), now, mode, self.p, self.last_hurt, self.hurt_bearing,
             self.npc_hurt, self.npc_bearing, self.last_threat_at,
             self.sound_t, self.sound_bearing,
+            face=(hidden if self.p.get("face_hidden", False) else None),
         )
 
         # Weapon pickups.
