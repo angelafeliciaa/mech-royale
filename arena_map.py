@@ -52,22 +52,32 @@ class Solid:
             return False
         if inside(x, y, self.rings[0]) and not any(inside(x, y, hole) for hole in self.rings[1:]):
             return True
-        return any(edge_distance_sq(x, y, edge) <= radius * radius
+        if radius <= 0:
+            return False  # only an exact edge hit (measure zero) is lost
+        r2 = radius * radius
+        return any(edge_distance_sq(x, y, edge) <= r2
                    for ring in self.rings for edge in ring)
 
     def intersects(self, start, end):
         x, y, z = start
-        dx, dy, dz = (b - a for a, b in zip(start, end))
+        dx = end[0] - x
+        dy = end[1] - y
+        dz = end[2] - z
         lo, hi = 0.0, 1.0
-        for p, d, lower, upper in ((x, dx, self.box[0], self.box[2]),
-                                    (y, dy, self.box[1], self.box[3]),
-                                    (z, dz, self.base, self.top)):
-            if abs(d) < 1e-9:
-                if not lower <= p <= upper:
+        left, bottom, right, top = self.box
+        for p, d, lower, upper in ((x, dx, left, right), (y, dy, bottom, top), (z, dz, self.base, self.top)):
+            if -1e-9 < d < 1e-9:
+                if p < lower or p > upper:
                     return False
                 continue
-            a, b = sorted(((lower - p) / d, (upper - p) / d))
-            lo, hi = max(lo, a), min(hi, b)
+            a = (lower - p) / d
+            b = (upper - p) / d
+            if a > b:
+                a, b = b, a
+            if a > lo:
+                lo = a
+            if b < hi:
+                hi = b
             if lo > hi:
                 return False
         if self.touches(x + lo * dx, y + lo * dy):
