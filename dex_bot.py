@@ -208,9 +208,14 @@ class Bot:
         }
         self.last_aim = [0.0, 0.0]
         self.mode = "init"
+        import gc
+        gc.collect()
+        gc.freeze()
+        gc.set_threshold(50000, 20, 100)
 
     # -------------------------------------------------------------- public act
     def act(self, obs: mf.Observation) -> mf.Action:
+        self.nav.begin_tick()
         try:
             action = self._step(obs)
             self.last_aim = list(action.get("aim", self.last_aim))
