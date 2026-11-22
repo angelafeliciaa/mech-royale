@@ -1,0 +1,4 @@
+kit/
+.git/
+*.md
+__pycache__/
