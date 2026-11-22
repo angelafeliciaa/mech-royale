@@ -21,7 +21,7 @@ import mechfight as mf
 # Branch profile selector: "v2", "stack", "aggro", or "duel".
 ACTIVE_PROFILE = "aggro"
 # Experiment knobs applied on top of every profile (base and squad).
-OVERRIDES = {}
+OVERRIDES = {'laser_seek': 400.0}
 
 _WEAPON_RANK = {"lightning": 3, "laser": 2, "mortar": 1}
 
