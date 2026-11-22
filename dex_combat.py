@@ -215,9 +215,12 @@ def compute_fire_and_aim(
     cfg, arena, me, target, foe, farm, farm_pos, seen,
     move_xy, now, mode, params, last_hurt, hurt_bearing,
     npc_hurt, npc_bearing, last_threat_at,
-    sound_t=-99.0, sound_bearing=0.0, face=None,
+    sound_t=-99.0, sound_bearing=0.0, face=None, laser_mode=None,
 ):
-    """Return (aim, fire, want_reload). `face`: last-known hunter to keep the torso on (rear hits x1.5)."""
+    """Return (aim, fire, want_reload). `face`: last-known hunter to keep the torso on (rear hits x1.5).
+
+    `laser_mode`: None = normal; "hold" = don't START a charge (peek cycle walking to cover);
+    "off" = never pull the laser trigger (shorted by lightning)."""
     x, y, zf = me["pos"]
     vx, vy, _ = me["vel"]
     st = me["stats"]
@@ -309,6 +312,9 @@ def compute_fire_and_aim(
             elif kind == "laser":
                 if not is_mech or dist > ws["range"] * 0.97:
                     continue
+                if laser_mode == "off" or (laser_mode == "hold" and w.get("charge", 0.0) <= 0.0):
+                    fire[i] = False
+                    continue
                 if urgent_move:
                     # Don't slow down urgent escapes with a laser charge; release immediately if already charged.
                     fire[i] = False
@@ -358,12 +364,30 @@ def compute_fire_and_aim(
                         fire[i] = True
 
     # Pre-charge laser when moving onto an engaged hidden target (unless suppressing urgent slowdown).
-    if target is None and foe is not None and not urgent_move:
+    laser_charging_hidden = False
+    if target is None and foe is not None and not urgent_move and laser_mode != "off":
         for i, w in enumerate(weapons[:2]):
             if w is not None and w["kind"] == "laser":
                 ws = w["stats"]
-                if w.get("cooldown", 0.0) <= 0.05 and foe["dist"] < ws["range"] and w.get("charge", 0.0) < ws["charge"] + ws["hold_s"] - 0.35:
+                charge = w.get("charge", 0.0)
+                if laser_mode == "hold" and charge <= 0.0:
+                    continue
+                if w.get("cooldown", 0.0) <= 0.05 and foe["dist"] < ws["range"] and charge < ws["charge"] + ws["hold_s"] - 0.35:
                     fire[i] = True
+                if charge > 0.0:
+                    laser_charging_hidden = True
+
+    if not have_aim and laser_charging_hidden:
+        # Pre-aim the torso at the hidden foe's predicted center while still covered, so the
+        # beam needs no slew once we step out (aim turns without LOS).
+        fp = foe["pos"]
+        fv = foe.get("vel", (0.0, 0.0, 0.0))
+        fh = cfg["mech"]["height"] * mech_scale(cfg, foe.get("cubes", 0))
+        px = fp[0] + fv[0] * (LATENCY + 0.1)
+        py = fp[1] + fv[1] * (LATENCY + 0.1)
+        pz = fp[2] + fh * 0.5
+        aim = [math.atan2(py - muzzle[1], px - muzzle[0]), math.atan2(pz - muzzle[2], max(1.0, math.hypot(px - muzzle[0], py - muzzle[1])))]
+        have_aim = True
 
     if not have_aim:
         watch = None

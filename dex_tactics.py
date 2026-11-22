@@ -103,8 +103,44 @@ def preferred_range(me, track, params):
     return r
 
 
-def fight_move(cfg, arena, nav, zone_tracker, obs, target, seen, cubes, want_los, params, state):
-    """Score current position + tactical ring around self for combat movement."""
+PEEK_MIN_DIST = 25.0
+PEEK_POP_FRAC = 0.85
+PEEK_HIDE_MAX_S = 1.5
+
+
+def laser_peek_phase(prev, since, now, charge, full, cooldown, visible, dist, in_range, shorted, cover_ok, skip):
+    """One step of the laser peek-shot cycle. Returns (phase, since).
+
+    Phases: none (plain fight) -> hide (visible, uncharged: walk to cover without charging)
+    -> charge (hidden: charge) -> pop (>= 85% charged: regain LOS and release) -> cool
+    (cooldown: back to cover, gun shoots if it still sees). 'open' = charge in the open
+    (no cover nearby, hide timed out, or already charging while exposed) until the shot is out.
+    """
+    if skip or shorted or not in_range or dist < PEEK_MIN_DIST:
+        phase = "none"
+    elif cooldown > 0.05 and charge <= 0.0:
+        phase = "cool"
+    elif charge >= full * PEEK_POP_FRAC:
+        phase = "pop"
+    elif prev == "open":
+        phase = "open"
+    elif not visible:
+        phase = "charge"
+    elif charge > 0.0:
+        phase = "open"
+    elif prev == "hide" and (now - since > PEEK_HIDE_MAX_S or not cover_ok):
+        phase = "open"
+    else:
+        phase = "hide"
+    if phase != prev:
+        since = now
+    return phase, since
+
+
+def fight_move(cfg, arena, nav, zone_tracker, obs, target, seen, cubes, want_los, params, state, info=None):
+    """Score current position + tactical ring around self for combat movement.
+
+    `info` (optional dict) receives any_hidden: a candidate without LOS to the target exists."""
     me = obs["self"]
     zone = obs["zone"]
     now = obs["t"]
@@ -157,8 +193,11 @@ def fight_move(cfg, arena, nav, zone_tracker, obs, target, seen, cubes, want_los
 
     # Evaluate stay-put (index -1) and 16 directions per ring.
     candidates = [(x, y, 0.0, 0.0, 0.0, True, -1)]
+    coarse_outer = params.get("ring2_coarse", False)
     for ri, r in enumerate(rings):
-        for dx, dy in _ANGLES_16:
+        for k, (dx, dy) in enumerate(_ANGLES_16):
+            if coarse_outer and ri > 0 and k & 1:
+                continue  # outer ring at 8 directions: half the LOS checks
             cx, cy = x + dx * r, y + dy * r
             if not nav.line_walkable(x, y, cx, cy) or not nav.is_free(cx, cy):
                 if ri == 0 and dx * sx + dy * sy > 0.9:
@@ -167,6 +206,7 @@ def fight_move(cfg, arena, nav, zone_tracker, obs, target, seen, cubes, want_los
             candidates.append((cx, cy, dx, dy, r, False, ri))
 
     want_corner = params["peek"] or params.get("dual_ring", False)
+    any_hidden = False
     for cx, cy, dx, dy, r, is_stay, ri in candidates:
         cz = arena.floor(cx, cy)
         d = math.hypot(tx - cx, ty - cy)
@@ -174,6 +214,8 @@ def fight_move(cfg, arena, nav, zone_tracker, obs, target, seen, cubes, want_los
         los = nav.los((cx, cy, cz + mh), tc)
         if los:
             score += 45.0 * want_los
+        else:
+            any_hidden = True
         if want_corner and ri == 0 and (los == (want_los > 0.0)):
             for q in range(0, 16, 4):
                 qdx, qdy = _ANGLES_16[q]
@@ -181,12 +223,6 @@ def fight_move(cfg, arena, nav, zone_tracker, obs, target, seen, cubes, want_los
                 if nav.is_free(qx, qy) and nav.los((qx, qy, arena.floor(qx, qy) + mh), tc) != los:
                     score += 8.0
                     break
-
-        body = (cx, cy, cz + body_h)
-        for _, eye_e, ep in others:
-            if math.hypot(ep[0] - cx, ep[1] - cy) <= 170.0:
-                if nav.los(eye_e, body):
-                    score -= 30.0
 
         score -= zone_tracker.penalty(zone, now, cx, cy)
         if near_cube is not None:
@@ -200,6 +236,14 @@ def fight_move(cfg, arena, nav, zone_tracker, obs, target, seen, cubes, want_los
             score -= 8.0
             if want_los < 0.0 and not los:
                 score += 14.0
+        if score <= best_score:
+            continue  # crossfire checks only subtract: this candidate cannot win (exact prune)
+
+        body = (cx, cy, cz + body_h)
+        for _, eye_e, ep in others:
+            if math.hypot(ep[0] - cx, ep[1] - cy) <= 170.0:
+                if nav.los(eye_e, body):
+                    score -= 30.0
         if score > best_score:
             best_score = score
             best_mx, best_my = dx, dy
@@ -207,6 +251,8 @@ def fight_move(cfg, arena, nav, zone_tracker, obs, target, seen, cubes, want_los
     if blocked_side:
         state["strafe"] = -state["strafe"]
         state["strafe_until"] = now + 0.5
+    if info is not None:
+        info["any_hidden"] = any_hidden
     return best_mx, best_my
 
 
