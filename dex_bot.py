@@ -25,23 +25,32 @@ OVERRIDES = {}
 
 _WEAPON_RANK = {"lightning": 3, "laser": 2, "mortar": 1}
 
+# Upgrade priority (econ pass). Per-stack value, sustained:
+#   plating   +15% EHP (unconditional; death is terminal, so first)
+#   gun_mag   20-round mag + 1.92 s reload = +31% sustained gun DPS (12 rounds / 2.4 s
+#             reload is the gun's real bottleneck; gun_rate only gives +7.7% once reloads count)
+#   gun_damage +15% DPS;  armor 8.7% / 9.5% / 10.5% EHP per stack
+#   nanites   regen 45->72 HP/s and 5->3.5 s delay: heals a 700 HP deficit in 13 s instead
+#             of 20 s between sequential hunters
+#   laser_damage +18% per laser cycle (> laser_charge +8.6% cycle time)
+#   lightning_efficiency +10% dmg and -35% energy (> range)
 _UPGRADE_ORDER_BASE = (
-    "plating", "armor", "gun_damage", "gun_rate", "nanites",
-    "lightning_efficiency", "lightning_range", "laser_damage", "laser_charge",
-    "servos", "gun_mag", "gun_velocity", "gyros", "lightning_chain",
+    "plating", "gun_mag", "gun_damage", "armor", "nanites", "gun_rate",
+    "lightning_efficiency", "laser_damage", "servos", "lightning_range", "laser_charge",
+    "gun_velocity", "gyros", "lightning_chain",
     "reactor", "capacitor", "mortar_reload", "mortar_splash", "mortar_velocity",
     "sensors", "jets", "laser_pierce",
 )
 _UPGRADE_ORDER_LASER = (
-    "plating", "armor", "laser_damage", "laser_charge", "gun_damage", "gun_rate",
-    "nanites", "lightning_efficiency", "lightning_range", "servos",
-    "gun_mag", "gun_velocity", "gyros", "lightning_chain", "reactor", "capacitor",
+    "plating", "laser_damage", "gun_mag", "gun_damage", "armor", "nanites",
+    "laser_charge", "gun_rate", "lightning_efficiency", "lightning_range", "servos",
+    "gun_velocity", "gyros", "lightning_chain", "reactor", "capacitor",
     "mortar_reload", "mortar_splash", "mortar_velocity", "sensors", "jets", "laser_pierce",
 )
 _UPGRADE_ORDER_LIGHTNING = (
-    "plating", "armor", "lightning_efficiency", "lightning_range", "gun_damage",
-    "gun_rate", "nanites", "servos", "lightning_chain", "laser_damage",
-    "laser_charge", "gun_mag", "gun_velocity", "gyros", "reactor", "capacitor",
+    "plating", "lightning_efficiency", "gun_mag", "gun_damage", "armor", "nanites",
+    "lightning_range", "gun_rate", "servos", "lightning_chain", "laser_damage",
+    "laser_charge", "gun_velocity", "gyros", "reactor", "capacitor",
     "mortar_reload", "mortar_splash", "mortar_velocity", "sensors", "jets", "laser_pierce",
 )
 
@@ -195,6 +204,10 @@ class Bot:
 
         self.loot_id = None
         self.loot_since = 0.0
+        # Where our last victim died (its cubes + 2 drop there), for pickup after the fight.
+        self.kill_xy = None
+        self.kill_at = -99.0
+        self.kill_cubes = 0
         self.home_xy = None
         self.home_at = -99.0
         self.explore_xy = None
@@ -257,7 +270,12 @@ class Bot:
                         self.npcs[by]["hit_me"] = now
             elif et == "kill":
                 self.kills += 1
-                self.tracks.pop(ev.get("target"), None)
+                victim = self.tracks.pop(ev.get("target"), None)
+                if victim is not None and now - victim["seen"] < 6.0:
+                    vp = victim["pos"]
+                    self.kill_xy = (vp[0], vp[1], vp[2])
+                    self.kill_at = now
+                    self.kill_cubes = int(victim.get("cubes", 0) or 0) + self.cfg["cubes"]["death_drop_extra"]
             elif et == "take_failed":
                 self.bad[ev.get("id")] = now + 10.0
             elif et == "dropped":
@@ -372,6 +390,8 @@ class Bot:
                 self.p["laser_first"] = True
                 self.p["laser_seek"] = 240.0
                 self.p["loot_radius"] = 150.0
+                self.p["explore"] = True
+                self.p["shoot_crates"] = True
                 self.p.update(OVERRIDES)
             elif self.prac_on:
                 self.p = squad_params(self.base_p, self.profile)
@@ -471,27 +491,48 @@ class Bot:
             if math.hypot(c["pos"][0] - x, c["pos"][1] - y) < cube_r:
                 consider("cube", c["id"], c["pos"], cube_v)
 
+        # Cubes from our last kill: head to the death spot even if the cubes are not in view yet.
+        if self.kill_xy is not None:
+            kd = math.hypot(self.kill_xy[0] - x, self.kill_xy[1] - y)
+            if now - self.kill_at > 25.0 or kd < 5.0:
+                self.kill_xy = None
+            elif me["cubes"] < cube_cap + 2 and kd < 120.0:
+                consider("ksite", -1, self.kill_xy, 55.0 + 22.0 * min(self.kill_cubes, 8))
+
+        # Early-game hunger: the squad sends one weak hunter at first, so power up before the rest arrive.
+        early = now < 100.0 and me["cubes"] < 6
+        npc_v = 85.0 * (1.5 if early else 1.0)
+        crate_v = cube_v * 0.6 * (1.3 if early else 1.0)
         if hp_frac > self.p["farm_hp"] and not danger and now < self.p["crate_until"]:
             for c in self.crates.values():
                 if math.hypot(c["pos"][0] - x, c["pos"][1] - y) < loot_r:
-                    consider("crate", c["id"], c["pos"], cube_v * 0.6)
+                    consider("crate", c["id"], c["pos"], crate_v)
             if self.p["farm_npc"] and me["cubes"] < cube_cap:
                 for n in self.npcs.values():
                     if now - n["seen"] < 12.0 and math.hypot(n["pos"][0] - x, n["pos"][1] - y) < loot_r:
-                        consider("npc", n["id"], n["pos"], 85.0)
+                        consider("npc", n["id"], n["pos"], npc_v)
 
         if self.p["use_drops"] and not danger:
+            my_id = me.get("id")
+            # Contest from farther away when healthy and few hunters have been seen recently.
+            hunters = sum(1 for t in self.tracks.values() if now - t["seen"] < 6.0)
+            drop_r = 175.0 if (hp_frac > 0.55 and hunters <= 1) else 115.0
             for d in obs.get("drops", ()):
                 dp = d["pos"]
                 dist = math.hypot(dp[0] - x, dp[1] - y)
-                if dist > 115.0 or dist / walk > d["lands_in"] + 15.0:
+                lands = d.get("lands_in", 0.0) or 0.0
+                if dist > drop_r or dist / walk > lands + 15.0:
+                    continue
+                holder = d.get("holder")
+                if holder is not None and holder != my_id:
                     continue
                 if any(
                     now - t["seen"] < 3.0 and math.hypot(t["pos"][0] - dp[0], t["pos"][1] - dp[1]) < d["radius"] + 35.0
                     for t in self.tracks.values()
                 ):
                     continue
-                consider("drop", d["id"], dp, 240.0)
+                # 3 cubes + full repair: worth more the more HP we are missing.
+                consider("drop", d["id"], dp, 240.0 + 120.0 * (1.0 - hp_frac))
 
         if best is None:
             self.loot_id = None
@@ -499,10 +540,22 @@ class Bot:
         if best[1] != self.loot_id:
             self.loot_id = best[1]
             self.loot_since = now
-        elif now - self.loot_since > 30.0:
-            self.bad[best[1]] = now + 60.0
-            self.loot_id = None
-            return None
+        else:
+            # A drop can legitimately take walk + fall (25 s) + capture (4 s); don't give up on it early.
+            limit = 30.0
+            if best[0] == "drop":
+                lands = 0.0
+                for d in obs.get("drops", ()):
+                    if d["id"] == best[1]:
+                        lands = d.get("lands_in", 0.0) or 0.0
+                limit = 40.0 + lands
+            if now - self.loot_since > limit:
+                if best[1] >= 0:
+                    self.bad[best[1]] = now + 60.0
+                else:
+                    self.kill_xy = None
+                self.loot_id = None
+                return None
         return best
 
     # -------------------------------------------------------------- courtyard/rooftop escape
@@ -735,7 +788,23 @@ class Bot:
                 self.cover_goal = self.nav.find_cover(
                     me["pos"], threats, st, lambda cx, cy: self.zone.penalty(zone, now, cx, cy),
                 )
-            if self.cover_goal is not None:
+            # Not under fire right now: a cube within a short walk heals +4% max HP and is permanent power.
+            heal_cube = None
+            if hp_frac > 0.22 and (not threats or now - self.last_hurt > 2.5):
+                heal_d = 40.0
+                for c in self.cubes.values():
+                    cp = c["pos"]
+                    cd = math.hypot(cp[0] - x, cp[1] - y)
+                    if (cd < heal_d and abs(cp[2] - zf) < 4.0
+                            and self.nav.reachable(cp[0], cp[1])
+                            and self.zone.penalty(zone, now, cp[0], cp[1]) == 0.0):
+                        heal_d = cd
+                        heal_cube = cp
+            if heal_cube is not None:
+                mx, my = self.nav.steer_to(me["pos"], (heal_cube[0], heal_cube[1]), now)
+                boost = me["energy"] > 10.0 and (mx != 0.0 or my != 0.0)
+                mode = "cover:cube"
+            elif self.cover_goal is not None:
                 if math.hypot(self.cover_goal[0] - x, self.cover_goal[1] - y) >= 1.5:
                     mx, my = self.nav.steer_to(me["pos"], self.cover_goal, now)
                 boost = me["energy"] > 10.0 and (mx != 0.0 or my != 0.0)
@@ -795,6 +864,18 @@ class Bot:
                 if best_cube is not None:
                     mx, my = self.nav.steer_to(me["pos"], (best_cube[0], best_cube[1]), now)
                     mode = "fight:cube"
+            # Keep banking a supply-drop capture (3 cubes + full HP) while trading at range with one foe.
+            if self.p["use_drops"] and hp_frac > 0.45 and crowd <= 1 and foe["dist"] > 35.0:
+                my_id = me.get("id")
+                for d in obs.get("drops", ()):
+                    if (d.get("lands_in", 1.0) or 0.0) > 0.0 or d.get("holder") not in (None, my_id):
+                        continue
+                    dp = d["pos"]
+                    if math.hypot(dp[0] - x, dp[1] - y) < d["radius"] - 2.0 and abs(dp[2] - zf) < 4.0:
+                        mx, my = 0.0, 0.0
+                        boost = False
+                        mode = "fight:drop"
+                        break
         elif zone_should and zdist > 2.0:
             mx, my = self.nav.steer_to(me["pos"], (zgx, zgy), now)
             travel_dist = zdist
