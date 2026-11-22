@@ -63,6 +63,8 @@ class NavGrid:
         self.min_y = float(terrain["minY"])
         self.step = float(terrain["step"])
         self.scale = float(terrain["scale"])
+        hs = self.arena.heights
+        self.max_h = max(max(hs) * self.scale, min(hs) * self.scale)
 
         raw_rows = self._rasterize_obstacles()
         self.hard_rows = _dilate_rows(raw_rows, self.nx, self.radius + 0.5)
@@ -101,6 +103,7 @@ class NavGrid:
         self.min_x = self.min_y = 0.0
         self.step = 1.0
         self.scale = 0.01
+        self.max_h = 0.0
         self.hard_rows = []
         self.blocked = bytearray()
         self.clearance = bytearray()
@@ -462,7 +465,7 @@ class NavGrid:
         self._path_goal = None
 
     # ----------------------------------------------------------------- A*
-    def find_path(self, start_xy, goal_xy, budget_s=0.014):
+    def find_path(self, start_xy, goal_xy, budget_s=0.010):
         if self.flat:
             return [goal_xy]
         s = self.nearest_free(self.cell(*start_xy), max_r=6)
@@ -485,6 +488,7 @@ class NavGrid:
         parent[s] = -1
         heap = [(h0 * 1.45, s)]
         best_node, best_h = s, h0
+        budget_s = self._left(budget_s)
         t0 = time.perf_counter()
         expanded = 0
 
@@ -603,7 +607,26 @@ class NavGrid:
         return ux, uy
 
     # ----------------------------------------------------------------- fast LOS
+    def begin_tick(self):
+        self.tick_t0 = time.perf_counter()
+        self._los_memo = {}
+
+    def _left(self, budget_s):
+        """Shrink an optional-work budget so a whole tick stays near 20 ms."""
+        used = time.perf_counter() - getattr(self, "tick_t0", time.perf_counter())
+        return max(0.002, min(budget_s, 0.020 - used))
+
     def los(self, start, end):
+        memo = getattr(self, "_los_memo", None)
+        if memo is None:
+            return self._los(start, end)
+        key = (start, end)
+        r = memo.get(key)
+        if r is None:
+            r = memo[key] = self._los(start, end)
+        return r
+
+    def _los(self, start, end):
         """Fast line-of-sight query against terrain heightfield and solid prisms."""
         sx, sy, sz = start
         ex, ey, ez = end
@@ -612,7 +635,7 @@ class NavGrid:
         dz = ez - sz
         dist = math.hypot(dx, dy)
 
-        if not self.flat and dist > 2.0:
+        if not self.flat and dist > 2.0 and min(sz, ez) <= self.max_h:
             steps = max(2, int(dist * 0.25) + 1)
             nx, ny = self.nx, self.ny
             nx1, ny1 = nx - 1, ny - 1
@@ -649,7 +672,7 @@ class NavGrid:
         return True
 
     # ----------------------------------------------------------------- BFS cover
-    def find_cover(self, pos, threats, stats, zone_penalty_fn, budget_s=0.009):
+    def find_cover(self, pos, threats, stats, zone_penalty_fn, budget_s=0.007):
         """Find a nearby walkable cover cell hiding body & head from threats (4 m sample stride)."""
         if not threats:
             return None
@@ -688,6 +711,7 @@ class NavGrid:
         checked = 0
         best_xy = None
         best_score = math.inf
+        budget_s = self._left(budget_s)
         t0 = time.perf_counter()
 
         while head < len(queue) and checked < 160:
