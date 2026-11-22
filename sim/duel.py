@@ -105,6 +105,14 @@ def make_controller(spec, hello, skill, seed, world, slot):
     h["seed"] = seed
     if spec == "house":
         bot = HouseBot(h, skill=skill, seed=seed)
+    elif spec == "dummy":  # stands still, faces the foe: a target for accuracy checks
+        def dummy_act(obs):
+            a = {"tick": obs["tick"], "move": [0.0, 0.0]}
+            if obs["mechs"]:
+                p, q = obs["mechs"][0]["pos"], obs["self"]["pos"]
+                a["aim"] = [math.atan2(p[1] - q[1], p[0] - q[0]), 0.0]
+            return a
+        return dummy_act
     else:
         cls = _BOT_CACHE.get(spec)
         if cls is None:
@@ -120,7 +128,9 @@ _BOT_CACHE = {}
 
 
 def run_duel(job):
-    (a, b, skill_a, skill_b, loadout_a, loadout_b, scenario, seed, max_t, alive, facing, trace_path) = job
+    (a, b, skill_a, skill_b, loadout_a, loadout_b, scenario, seed, max_t, alive, facing, trace_path, swap) = job
+    if swap:  # mirror: same seed/spawns, sides exchanged; results are mapped back so index 0 is always `a`
+        a, b, skill_a, skill_b, loadout_a, loadout_b = b, a, skill_b, skill_a, loadout_b, loadout_a
     hello = load_hello()
     rng = random.Random(seed)
     world = World(hello["config"], arena(), seed=seed, max_t=max_t, alive=alive)
@@ -139,7 +149,11 @@ def run_duel(job):
             make_controller(b, hello, skill_b, seed * 2 + 2, world, 1)]
     trace = [] if trace_path else None
     res = world.run(ctls, trace=trace)
+    if swap:
+        res["mechs"] = [dict(res["mechs"][1], id=0, name="A"), dict(res["mechs"][0], id=1, name="B")]
+        res["winner"] = None if res["winner"] is None else 1 - res["winner"]
     res["seed"] = seed
+    res["swap"] = swap
     res["wall"] = round(time.time() - t0, 2)
     res["spawn_dist"] = round(math.dist(pa[:2], pb[:2]), 1)
     if trace_path:
@@ -152,6 +166,7 @@ def summarize(results, label_a, label_b):
     wins_a = sum(1 for r in results if r["winner"] == 0)
     wins_b = sum(1 for r in results if r["winner"] == 1)
     draws = n - wins_a - wins_b
+    no_contact = sum(1 for r in results if all(m["damage_dealt"] == 0 for m in r["mechs"]))
     ttk = [r["t"] for r in results if r["winner"] is not None]
 
     def side(i):
@@ -170,7 +185,7 @@ def summarize(results, label_a, label_b):
 
     lines = []
     se = math.sqrt(max(1e-9, (wins_a / n) * (1 - wins_a / n) / n)) if n else 0
-    lines.append(f"{label_a} vs {label_b}: n={n}  A wins {wins_a} ({100*wins_a/n:.0f}% +-{100*se:.0f})  B wins {wins_b}  draws {draws}"
+    lines.append(f"{label_a} vs {label_b}: n={n}  A wins {wins_a} ({100*wins_a/n:.0f}% +-{100*se:.0f})  B wins {wins_b}  draws {draws} (no contact {no_contact})"
                  f"  mean TTK {statistics.mean(ttk):.1f}s" if ttk else f"{label_a} vs {label_b}: n={n} no decisive duels")
     for i, lab in ((0, "A"), (1, "B")):
         hp, dealt, taken, rates, rear = side(i)
@@ -188,7 +203,7 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--a", default="working")
     ap.add_argument("--b", default="house")
-    ap.add_argument("--n", type=int, default=20)
+    ap.add_argument("--n", type=int, default=20, help="duels (mirrored pairs share spawns: n/2 distinct seeds)")
     ap.add_argument("--loadout", default="gun", choices=sorted(LOADOUTS))
     ap.add_argument("--loadout-b", default=None, choices=sorted(LOADOUTS))
     ap.add_argument("--skill", default="mid", choices=("easy", "mid", "hard"), help="house bot skill (B, or A if A is house)")
@@ -199,6 +214,7 @@ def main(argv=None):
     ap.add_argument("--alive", type=int, default=16, help="`alive` shown to bots (16 mimics early match)")
     ap.add_argument("--facing", default="toward", choices=("toward", "random"))
     ap.add_argument("--jobs", type=int, default=max(1, (os.cpu_count() or 2) - 1))
+    ap.add_argument("--no-mirror", action="store_true", help="don't play each seed from both sides (halves cost, adds side bias)")
     ap.add_argument("--json", default=None, help="write per-duel results here")
     ap.add_argument("--trace", default=None, help="(n=1) write a position/hp trace json here")
     args = ap.parse_args(argv)
@@ -206,13 +222,13 @@ def main(argv=None):
     # resolve refs once in the parent so workers share the exported dir
     specs = {}
     for s in (args.a, args.b):
-        if s not in ("house",) and s not in specs:
+        if s not in ("house", "dummy") and s not in specs:
             cls = load_bot_class(s)
             specs[s] = cls._sim_source
     a_spec, b_spec = specs.get(args.a, args.a), specs.get(args.b, args.b)
     jobs = [(a_spec, b_spec, args.skill_a or args.skill, args.skill, args.loadout, args.loadout_b or args.loadout,
-             args.scenario, args.seed * 100000 + i, args.max_t, args.alive, args.facing,
-             args.trace if args.n == 1 else None) for i in range(args.n)]
+             args.scenario, args.seed * 100000 + i // (1 if args.no_mirror else 2), args.max_t, args.alive, args.facing,
+             args.trace if args.n == 1 else None, (not args.no_mirror) and i % 2 == 1) for i in range(args.n)]
     t0 = time.time()
     if args.jobs > 1 and args.n > 1:
         with mp.Pool(args.jobs) as pool:
