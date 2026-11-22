@@ -39,10 +39,10 @@ _UPGRADE_ORDER_LASER = (
     "mortar_reload", "mortar_splash", "mortar_velocity", "sensors", "jets", "laser_pierce",
 )
 _UPGRADE_ORDER_LIGHTNING = (
-    "plating", "armor", "lightning_efficiency", "lightning_range", "gun_damage",
-    "gun_rate", "nanites", "servos", "lightning_chain", "laser_damage",
-    "laser_charge", "gun_mag", "gun_velocity", "gyros", "reactor", "capacitor",
-    "mortar_reload", "mortar_splash", "mortar_velocity", "sensors", "jets", "laser_pierce",
+    "plating", "armor", "lightning_range", "lightning_efficiency", "gun_damage",
+    "gun_rate", "nanites", "capacitor", "reactor", "servos", "lightning_chain",
+    "laser_damage", "laser_charge", "gun_mag", "gun_velocity", "gyros", "jets",
+    "mortar_reload", "mortar_splash", "mortar_velocity", "sensors", "laser_pierce",
 )
 
 
@@ -728,11 +728,16 @@ class Bot:
             mx, my = fight_move(
                 self.cfg, self.arena, self.nav, self.zone, obs, foe, seen, self.cubes, want_los, move_p, self.fight_state,
             )
-            if light is not None and foe["dist"] > 50.0 and me["energy"] > 55.0 and want_los > 0.0:
+            # Lightning: boost only to close into arc range, then save every point of energy for the arc.
+            in_arc = False
+            if light is not None:
+                arc_r = light["stats"].get("range", 45.0)
+                in_arc = foe["dist"] <= arc_r + 6.0 and foe["los"]
+                if foe["dist"] > arc_r + 8.0 and me["energy"] > 50.0 and want_los > 0.0:
+                    boost = True
+            if self.p["finish_rush"] and closing_finish and foe["dist"] > 40.0 and me["energy"] > 35.0 and not in_arc and (laser is None or laser.get("charge", 0.0) <= 0.0):
                 boost = True
-            if self.p["finish_rush"] and closing_finish and foe["dist"] > 40.0 and me["energy"] > 35.0 and (laser is None or laser.get("charge", 0.0) <= 0.0):
-                boost = True
-            if self.p["fight_boost"] > 0.0 and me["energy"] > self.p["fight_boost"] and (laser is None or laser.get("charge", 0.0) <= 0.0) and (light is None or me["energy"] > 60.0):
+            if self.p["fight_boost"] > 0.0 and me["energy"] > self.p["fight_boost"] and (laser is None or laser.get("charge", 0.0) <= 0.0) and (light is None or (not in_arc and me["energy"] > 60.0)):
                 boost = True
             mode = "fight"
             if self.p["fight_loot"] > 0.0:

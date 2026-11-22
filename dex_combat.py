@@ -84,6 +84,10 @@ def mortar_aim(arena, tube, foot, target_vel, speed, gravity, stats):
     return yaw, pitch
 
 
+def w_dry(gun):
+    return gun.get("ammo", 0) <= 0 or gun.get("reload", 0.0) > 0.0
+
+
 def weapon_slot(weapons, kind):
     for i, w in enumerate(weapons):
         if w is not None and w["kind"] == kind:
@@ -129,6 +133,8 @@ def select_targets(cfg, me, tracks, now, params, stick_id, stick_at, alive, late
     hidden = None
     shy = None
     best_score = math.inf
+    _, light_w = weapon_slot(me["weapons"], "lightning")
+    light_r = light_w["stats"].get("range", 45.0) if (light_w is not None and me["energy"] > 20.0) else 0.0
 
     for t in tracks.values():
         if now - t["seen"] > 2.5:
@@ -183,6 +189,8 @@ def select_targets(cfg, me, tracks, now, params, stick_id, stick_at, alive, late
             score -= 40.0
         if t["closing"] > 3.0:
             score -= 15.0
+        if light_r > 0.0 and dist < light_r and "laser" in t.get("weapons", ()):
+            score -= 30.0
         if score < best_score:
             best_score = score
             target = t
@@ -253,6 +261,17 @@ def compute_fire_and_aim(
         hp_ang = math.atan2(dp[2] - muzzle[2], math.hypot(dp[0] - muzzle[0], dp[1] - muzzle[1]))
         aim = [gy, gp] if gun is not None else [hy, hp_ang]
         have_aim = True
+        _, light_w = weapon_slot(weapons, "lightning")
+        if light_w is not None and gun is not None:
+            lws = light_w["stats"]
+            if dist < lws["range"] - 1.5 and me["energy"] >= lws["energy"]:
+                if not gun_ok or w_dry(gun):
+                    aim = [hy, hp_ang]
+                else:
+                    half = math.radians(lws["cone_deg"]) * 0.5 - 0.12
+                    off = angle_diff(gy, hy)
+                    if abs(off) > half:
+                        aim = [hy + (half if off > 0.0 else -half), gp]
 
         tol_y = math.atan2(tr * 0.75, max(dist, 1.0))
         tol_p = math.atan2(th * 0.4, max(dist, 1.0))
@@ -274,6 +293,8 @@ def compute_fire_and_aim(
                     fire[i] = True
             elif kind == "lightning":
                 cone = math.radians(ws["cone_deg"])
+                if not is_mech and me["energy"] < 45.0:
+                    continue
                 if dist < ws["range"] - 1.5 and abs(angle_diff(hy, me["aim"][0])) < cone * 0.5 - 0.05 and me["energy"] >= ws["energy"]:
                     fire[i] = True
             elif kind == "laser":
