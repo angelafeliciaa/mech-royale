@@ -11,6 +11,7 @@ SKILLS = {
     "easy": {"aim_noise": 4.0, "delay": 0.4, "lead": 0.5, "range": 90.0, "flip": 0.4},
     "mid": {"aim_noise": 1.5, "delay": 0.2, "lead": 0.9, "range": 75.0, "flip": 0.7},
     "hard": {"aim_noise": 0.4, "delay": 0.1, "lead": 1.0, "range": 60.0, "flip": 1.0},
+    "expert": {"aim_noise": 0.15, "delay": 0.0, "lead": 1.0, "range": 50.0, "flip": 1.2},
 }
 
 
@@ -35,8 +36,39 @@ class HouseBot:
         self.sound_bearing = 0.0
         self.sound_t = -99.0
         self.aim = [0.0, 0.0]
+        self.prog_pos = None
+        self.prog_t = 0.0
+        self.detour = None
+        self.detour_until = -1.0
 
     def act(self, obs):
+        act = self._act(obs)
+        return self._unstick(obs, act)
+
+    def _unstick(self, obs, act):
+        """If we commanded movement but didn't progress for 1 s, detour sideways for 1.5 s (walls)."""
+        now = obs["t"]
+        p = obs["self"]["pos"]
+        mv = act.get("move") or [0.0, 0.0]
+        if math.hypot(*mv) < 0.1:
+            self.prog_pos, self.prog_t = p, now
+            return act
+        if self.detour is not None and now < self.detour_until:
+            act["move"] = self.detour
+            act["jump"] = True
+            act["boost"] = True
+            return act
+        if self.prog_pos is None or math.dist(p[:2], self.prog_pos[:2]) > 3.0:
+            self.prog_pos, self.prog_t = p, now
+        elif now - self.prog_t > 1.0:
+            side = 1.0 if self.rng.random() < 0.5 else -1.0
+            self.detour = [-mv[1] * side, mv[0] * side]
+            self.detour_until = now + 1.5
+            self.prog_pos, self.prog_t = p, now
+            act["move"] = self.detour
+        return act
+
+    def _act(self, obs):
         now = obs["t"]
         # reaction delay: act on a delayed view of the enemy
         self.buf.append((now, obs))

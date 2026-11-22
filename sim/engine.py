@@ -70,10 +70,15 @@ def seg_cylinder(p0, p1, cx, cy, cz, radius, height):
 
 
 class Mech:
-    def __init__(self, mid, pos, yaw, cfg, weapons, name):
+    def __init__(self, mid, pos, yaw, cfg, weapons, name, team=None):
         m = cfg["mech"]
         self.id = mid
         self.name = name
+        self.team = mid if team is None else team
+        self.scale = 1.0
+        self.dmg_mult = 1.0
+        self.killed_by = None
+        self.died_at = None
         self.pos = list(pos)
         self.vel = [0.0, 0.0, 0.0]
         self.aim = [yaw, 0.0]
@@ -108,6 +113,7 @@ class Mech:
         self.sounds = []
         self.beams = []
         self.seen_at = {}  # other id -> last time seen
+        self.hit_by = {}  # attacker id -> last time it damaged us
         self.stats = {"damage_dealt": 0.0, "damage_taken": 0.0,
                       "shots": {"gun": 0, "laser": 0, "lightning": 0},
                       "hits": {"gun": 0, "laser": 0, "lightning": 0},
@@ -121,12 +127,22 @@ class Mech:
     def muzzle(self, cfg):
         yaw, pitch = self.aim
         d = (math.cos(pitch) * math.cos(yaw), math.cos(pitch) * math.sin(yaw), math.sin(pitch))
-        r = cfg["mech"]["radius"] + 0.5
-        return [self.pos[0] + d[0] * r, self.pos[1] + d[1] * r, self.pos[2] + cfg["mech"]["muzzle_height"] + d[2] * r], d
+        r = cfg["mech"]["radius"] * self.scale + 0.5
+        return [self.pos[0] + d[0] * r, self.pos[1] + d[1] * r, self.pos[2] + cfg["mech"]["muzzle_height"] * self.scale + d[2] * r], d
+
+    def add_cubes(self, cfg, n):
+        c = cfg["cubes"]
+        self.cubes += n
+        k = min(self.cubes, c["stat_cap"])
+        new_max = cfg["mech"]["hp"] * (1 + c["hp_per_cube"] * k)
+        self.hp += new_max - self.max_hp
+        self.max_hp = new_max
+        self.dmg_mult = 1 + c["damage_per_cube"] * k
+        self.scale = 1 + c["size_per_cube"] * self.cubes
 
 
 class World:
-    def __init__(self, cfg, arena: ArenaMap, seed=0, max_t=90.0, alive=16):
+    def __init__(self, cfg, arena: ArenaMap, seed=0, max_t=90.0, alive=16, zone_shrink=False):
         self.cfg = cfg
         self.arena = arena
         self.rng = random.Random(seed)
@@ -138,15 +154,92 @@ class World:
         self.mechs = []
         self.bullets = []
         self.next_bullet = 1
+        self.pickups = []  # {"id","kind","pos"}
+        self.next_pickup = 8000
         z = cfg["zone"]
         self.zone = {"center": list(z["start_center"]), "radius": z["start_radius"],
                      "next_center": list(z["start_center"]), "next_radius": z["phases"][0]["radius"],
                      "shrink_start": 600, "shrink_end": 650, "dps": z["phases"][0]["dps"]}
+        self.zone_shrink = zone_shrink
+        self.phase_i = -1
+        self.phase_from = None
+        if zone_shrink:
+            self._start_phase(0, 0.0)
         self.log = []
 
+    def _start_phase(self, i, t0):
+        z = self.cfg["zone"]
+        ph = z["phases"][i]
+        cur_c, cur_r = list(self.zone["center"]), self.zone["radius"]
+        self.phase_i = i
+        self.phase_from = (cur_c, cur_r)
+        slack = max(0.0, cur_r - ph["radius"])
+        a = self.rng.uniform(0, TAU)
+        d = slack * math.sqrt(self.rng.random())
+        self.zone["next_center"] = [cur_c[0] + d * math.cos(a), cur_c[1] + d * math.sin(a)]
+        self.zone["next_radius"] = ph["radius"]
+        self.zone["shrink_start"] = t0 + ph["hold_s"]
+        self.zone["shrink_end"] = t0 + ph["hold_s"] + ph["shrink_s"]
+        self.zone["dps"] = ph["dps"]
+
+    def zone_tick(self):
+        if not self.zone_shrink:
+            return
+        z = self.zone
+        if self.t >= z["shrink_end"]:
+            z["center"], z["radius"] = list(z["next_center"]), z["next_radius"]
+            if self.phase_i + 1 < len(self.cfg["zone"]["phases"]):
+                self._start_phase(self.phase_i + 1, z["shrink_end"])
+            else:
+                z["shrink_start"] = z["shrink_end"] = 1e9
+        elif self.t >= z["shrink_start"]:
+            f = (self.t - z["shrink_start"]) / max(1e-9, z["shrink_end"] - z["shrink_start"])
+            c0, r0 = self.phase_from
+            z["center"] = [c0[0] + (z["next_center"][0] - c0[0]) * f, c0[1] + (z["next_center"][1] - c0[1]) * f]
+            z["radius"] = r0 + (z["next_radius"] - r0) * f
+
     # ---------------------------------------------------------------- setup
-    def add_mech(self, pos, yaw, weapons, name):
-        m = Mech(len(self.mechs), pos, yaw, self.cfg, weapons, name)
+    def add_pickup(self, kind, pos):
+        self.pickups.append({"id": self.next_pickup, "kind": kind, "pos": [pos[0], pos[1], pos[2]]})
+        self.next_pickup += 1
+
+    def take_pickup(self, m, pid, drop_slot):
+        """The `take` action (protocol section 7, weapon loot)."""
+        lr = self.cfg["loot"]
+        pk = next((p for p in self.pickups if p["id"] == pid), None)
+        if pk is None:
+            m.events.append({"type": "take_failed", "id": pid, "reason": "gone"})
+            return
+        if math.dist(m.pos[:2], pk["pos"][:2]) > lr["pickup_radius"] or abs(m.pos[2] - pk["pos"][2]) > 4.0:
+            m.events.append({"type": "take_failed", "id": pid, "reason": "range"})
+            return
+        if any(w and w["kind"] == pk["kind"] for w in m.weapons):
+            m.events.append({"type": "take_failed", "id": pid, "reason": "have"})
+            return
+        slot = next((i for i, w in enumerate(m.weapons) if w is None), None)
+        if slot is None:
+            if drop_slot not in (0, 1):
+                m.events.append({"type": "take_failed", "id": pid, "reason": "full"})
+                return
+            old = m.weapons[drop_slot]
+            if old["kind"] == "laser" and old["charge"] > 0:
+                m.events.append({"type": "take_failed", "id": pid, "reason": "busy"})
+                return
+            slot = drop_slot
+            self.add_pickup(old["kind"], m.pos)
+            m.events.append({"type": "dropped", "id": self.next_pickup - 1, "kind": old["kind"], "slot": slot})
+        self.pickups.remove(pk)
+        w = {"kind": pk["kind"], "cooldown": max(lr["equip_s"], self.cfg["weapons"][pk["kind"]]["cooldown"]),
+             "stats": dict(self.cfg["weapons"][pk["kind"]])}
+        if pk["kind"] == "gun":
+            w["ammo"], w["reload"] = w["stats"]["mag"], 0.0
+        if pk["kind"] == "laser":
+            w["charge"], w["hold"], w["release"] = 0.0, 0.0, False
+        m.weapons[slot] = w
+        m.events.append({"type": "took", "id": pid, "kind": pk["kind"], "slot": slot})
+
+    def add_mech(self, pos, yaw, weapons, name, team=None):
+        m = Mech(len(self.mechs), pos, yaw, self.cfg, weapons, name, team)
         self.mechs.append(m)
         return m
 
@@ -187,10 +280,10 @@ class World:
         return lo
 
     def center(self, m):
-        return (m.pos[0], m.pos[1], m.pos[2] + self.cfg["mech"]["height"] * 0.5)
+        return (m.pos[0], m.pos[1], m.pos[2] + self.cfg["mech"]["height"] * 0.5 * m.scale)
 
     def eye(self, m):
-        return (m.pos[0], m.pos[1], m.pos[2] + self.cfg["mech"]["eye_height"])
+        return (m.pos[0], m.pos[1], m.pos[2] + self.cfg["mech"]["eye_height"] * m.scale)
 
     # ---------------------------------------------------------------- damage
     def damage(self, src, dst, amount, weapon, from_dir):
@@ -200,11 +293,12 @@ class World:
         m = self.cfg["mech"]
         bearing = math.atan2(-from_dir[1], -from_dir[0])  # toward source
         rear = abs(wrap(bearing - dst.aim[0])) > math.radians(m["front_arc_deg"]) * 0.5
-        amt = amount * (1.0 - m.get("armor", 0.0))
+        amt = amount * src.dmg_mult * (1.0 - m.get("armor", 0.0))
         if rear:
             amt *= m["rear_mult"]
         amt = round(amt, 2)
         dst.hp -= amt
+        dst.hit_by[src.id] = self.t
         dst.last_combat = self.t
         src.last_combat = self.t
         src.stats["damage_dealt"] += amt
@@ -223,7 +317,11 @@ class World:
         if dst.hp <= 0:
             dst.hp = 0.0
             dst.alive = False
+            dst.killed_by = (src.id, weapon)
+            dst.died_at = self.t
             src.events.append({"type": "kill", "target": dst.id})
+            src.add_cubes(self.cfg, dst.cubes + self.cfg["cubes"]["death_drop_extra"])
+            src.events.append({"type": "pickup", "cubes": src.cubes})
             self.sound(dst, "death")
         return amt
 
@@ -265,9 +363,9 @@ class World:
         best, target = t_wall, None
         R, H = self.cfg["mech"]["radius"], self.cfg["mech"]["height"]
         for o in self.mechs:
-            if o is m or not o.alive:
+            if o is m or not o.alive or o.team == m.team:
                 continue
-            t = seg_cylinder(origin, end, o.pos[0], o.pos[1], o.pos[2], R, H)
+            t = seg_cylinder(origin, end, o.pos[0], o.pos[1], o.pos[2], R * o.scale, H * o.scale)
             if t is not None and t < best:
                 best, target = t, o
         hit = [origin[i] + (end[i] - origin[i]) * best for i in range(3)]
@@ -298,7 +396,7 @@ class World:
         half = math.radians(ws["cone_deg"]) * 0.5
         best, target = ws["range"], None
         for o in self.mechs:
-            if o is m or not o.alive:
+            if o is m or not o.alive or o.team == m.team:
                 continue
             c = self.center(o)
             dist = math.dist(origin, c)
@@ -390,10 +488,11 @@ class World:
                 p1 = [p0[i] + step[i] * f for i in range(3)]
             # mechs
             best, target = 1.0, None
+            shooter = self.mechs[b["by"]]
             for o in self.mechs:
-                if o.id == b["by"] or not o.alive:
+                if o is shooter or not o.alive or o.team == shooter.team:
                     continue
-                t = seg_cylinder(p0, p1, o.pos[0], o.pos[1], o.pos[2], R, H)
+                t = seg_cylinder(p0, p1, o.pos[0], o.pos[1], o.pos[2], R * o.scale, H * o.scale)
                 if t is not None and t < best:
                     best, target = t, o
             if target is not None:
@@ -529,6 +628,8 @@ class World:
             if m.hp <= 0:
                 m.hp = 0.0
                 m.alive = False
+                m.killed_by = (None, "zone")
+                m.died_at = self.t
         elif self.t - m.last_combat >= cfg["regen_delay"]:
             m.hp = min(m.max_hp, m.hp + cfg["regen_per_s"] * dt)
 
@@ -547,7 +648,7 @@ class World:
     def can_see(self, viewer, other):
         eye = self.eye(viewer)
         c = self.center(other)
-        top = (other.pos[0], other.pos[1], other.pos[2] + self.cfg["mech"]["height"])
+        top = (other.pos[0], other.pos[1], other.pos[2] + self.cfg["mech"]["height"] * other.scale)
         return self.visible_point(viewer, eye, c) or self.visible_point(viewer, eye, top)
 
     # ---------------------------------------------------------------- obs
@@ -562,6 +663,14 @@ class World:
         if action.get("aim") is not None:
             m.cmd_aim = [float(action["aim"][0]), float(action["aim"][1])]
         m.action = a
+        if action.get("take") is not None:
+            self.take_pickup(m, action["take"], action.get("drop"))
+        elif action.get("drop") in (0, 1) and m.weapons[action["drop"]] is not None:
+            old = m.weapons[action["drop"]]
+            if not (old["kind"] == "laser" and old["charge"] > 0):
+                m.weapons[action["drop"]] = None
+                self.add_pickup(old["kind"], m.pos)
+                m.events.append({"type": "dropped", "id": self.next_pickup - 1, "kind": old["kind"], "slot": action["drop"]})
 
     def build_obs(self, m):
         cfg = self.cfg
@@ -579,30 +688,42 @@ class World:
                 o["charge"] = r2(w["charge"])
             weapons.append(o)
         in_zone = math.dist(m.pos[:2], self.zone["center"]) <= self.zone["radius"]
+        stats = dict(cfg["mech"])
+        if m.scale != 1.0:
+            for k in ("radius", "height", "eye_height", "muzzle_height"):
+                stats[k] = r2(stats[k] * m.scale)
+            stats["hp"] = m.max_hp
         me = {"id": m.id, "pos": [r2(c) for c in m.pos], "vel": [r2(c) for c in m.vel],
               "aim": [r3(m.aim[0]), r3(m.aim[1])], "hp": r2(m.hp), "max_hp": m.max_hp,
               "energy": r2(m.energy), "max_energy": m.max_energy, "grounded": m.grounded,
-              "cubes": 0, "upgrades": [], "weapons": weapons, "in_zone": in_zone,
-              "stats": dict(cfg["mech"])}
+              "cubes": m.cubes, "upgrades": [], "weapons": weapons, "in_zone": in_zone,
+              "stats": stats}
         mechs = []
         for o in self.mechs:
             if o is m or not o.alive:
                 continue
-            if self.can_see(m, o):
+            if math.dist(m.pos[:2], o.pos[:2]) <= v["range"] and self.can_see(m, o):
                 m.seen_at[o.id] = self.t
             if self.t - m.seen_at.get(o.id, -99.0) <= v["memory_s"]:
                 mechs.append({"id": o.id, "kind": "mech", "pos": [r2(c) for c in o.pos], "vel": [r2(c) for c in o.vel],
-                              "aim": [r3(o.aim[0]), r3(o.aim[1])], "hp": r2(o.hp), "max_hp": o.max_hp, "cubes": 0,
+                              "aim": [r3(o.aim[0]), r3(o.aim[1])], "hp": r2(o.hp), "max_hp": o.max_hp, "cubes": o.cubes,
                               "weapons": [w["kind"] for w in o.weapons if w], "charging": o.charging})
         eye = self.eye(m)
         projectiles = [{"id": b["id"], "kind": "gun", "pos": [r2(c) for c in b["pos"]], "vel": [r2(c) for c in b["vel"]]}
                        for b in self.bullets if b["by"] != m.id and self.visible_point(m, eye, b["pos"])]
+        pickups = [{"id": p["id"], "kind": p["kind"], "pos": [r2(c) for c in p["pos"]]} for p in self.pickups
+                   if math.dist(eye[:2], p["pos"][:2]) <= v["range"] and self.visible_point(m, eye, (p["pos"][0], p["pos"][1], p["pos"][2] + 1.0))]
         sounds = [{"kind": s["kind"], "bearing": s["bearing"], "dist": s["dist"], "age": r2(self.t - s["t"])} for s in m.sounds]
         beams = [{"by": b["by"], "kind": b["kind"], "path": b["path"], "age": r2(self.t - b["t"])} for b in m.beams]
-        obs = {"type": "obs", "tick": self.tick, "t": r2(self.t), "alive": self.alive_shown, "self": me,
-               "mechs": mechs, "projectiles": projectiles, "crates": [], "cubes": [], "pickups": [],
+        alive = sum(1 for o in self.mechs if o.alive) if self.zone_shrink else self.alive_shown
+        obs = {"type": "obs", "tick": self.tick, "t": r2(self.t), "alive": alive, "self": me,
+               "mechs": mechs, "projectiles": projectiles, "crates": [], "cubes": [], "pickups": pickups,
                "sounds": sounds, "beams": beams, "events": list(m.events),
-               "zone": dict(self.zone), "offer": None, "drops": []}
+               "zone": {"center": [r2(self.zone["center"][0]), r2(self.zone["center"][1])], "radius": r2(self.zone["radius"]),
+                        "next_center": [r2(self.zone["next_center"][0]), r2(self.zone["next_center"][1])],
+                        "next_radius": self.zone["next_radius"], "shrink_start": r2(self.zone["shrink_start"]),
+                        "shrink_end": r2(self.zone["shrink_end"]), "dps": self.zone["dps"]},
+               "offer": None, "drops": []}
         m.events, m.sounds, m.beams = [], [], []
         return obs
 
@@ -618,6 +739,7 @@ class World:
             if m.alive:
                 self.move_tick(m)
         self.push_apart()
+        self.zone_tick()
         for m in self.mechs:
             if m.alive:
                 self.regen_tick(m)
@@ -651,5 +773,6 @@ class World:
         alive = [m for m in self.mechs if m.alive]
         winner = alive[0].id if len(alive) == 1 else None
         return {"winner": winner, "t": r2(self.t), "mechs": [
-            {"id": m.id, "name": m.name, "hp": r2(m.hp), "alive": m.alive, **m.stats} for m in self.mechs],
+            {"id": m.id, "name": m.name, "hp": r2(m.hp), "alive": m.alive, "cubes": m.cubes,
+             "killed_by": m.killed_by, "died_at": m.died_at, **m.stats} for m in self.mechs],
             "log": self.log}
