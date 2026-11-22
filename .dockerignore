@@ -2,3 +2,4 @@ kit/
 .git/
 *.md
 __pycache__/
+mkvariant.sh
