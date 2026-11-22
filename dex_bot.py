@@ -21,7 +21,7 @@ import mechfight as mf
 # Branch profile selector: "v2", "stack", "aggro", or "duel".
 ACTIVE_PROFILE = "aggro"
 # Experiment knobs applied on top of every profile (base and squad).
-OVERRIDES = {'laser_seek':400.0,'loot_radius':200.0,'light_range':85.0}
+OVERRIDES = {'laser_seek':400.0,'loot_radius':200.0,'light_range':85.0,'laser_rush':150.0}
 
 _WEAPON_RANK = {"lightning": 3, "laser": 2, "mortar": 1}
 
@@ -449,6 +449,20 @@ class Bot:
         cur = rank(me["weapons"][1]["kind"]) if len(me["weapons"]) > 1 and me["weapons"][1] is not None else 0
         return rank(kind) > cur
 
+    def _laser_goal(self, me):
+        x, y, zf = me["pos"]
+        best = None
+        best_d = self.p["laser_seek"]
+        for p in self.pickups.values():
+            if p["kind"] != "laser" or p["id"] in self.bad:
+                continue
+            pp = p["pos"]
+            d = math.hypot(pp[0] - x, pp[1] - y)
+            if d < best_d and pp[2] - self.arena.floor(pp[0], pp[1]) <= 3.2 and self.nav.reachable(pp[0], pp[1]):
+                best_d = d
+                best = pp
+        return best
+
     def _choose_loot(self, obs, hp_frac, danger):
         me = obs["self"]
         zone = obs["zone"]
@@ -828,6 +842,14 @@ class Bot:
             else:
                 mx, my = self.nav.steer_to(me["pos"], (zgx, zgy), now)
                 mode = "flee"
+        elif (self.p.get("laser_rush", 0.0) > now and laser is None and foe is not None
+                and foe["dist"] > 35.0 and not finishing and self._laser_goal(me) is not None):
+            # No laser yet: keep moving to the nearest known laser pickup instead of standing
+            # to trade; aim/fire still track the target while we move.
+            lp = self._laser_goal(me)
+            mx, my = self.nav.steer_to(me["pos"], (lp[0], lp[1]), now)
+            boost = me["energy"] > 40.0
+            mode = "laser_rush"
         elif foe is not None:
             ready = gun is not None and gun.get("ammo", 0) > 0 and gun.get("reload", 0.0) <= 0.25 and foe["dist"] <= gun["stats"]["range"] - 10.0
             hot = laser is not None and laser.get("charge", 0.0) >= laser["stats"]["charge"] - 0.3 and foe["dist"] <= laser["stats"]["range"] - 5.0
